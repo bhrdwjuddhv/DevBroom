@@ -156,7 +156,9 @@ recognise.
 | **Recommended** (best answers) | Qwen2.5-3B-Instruct Q4_K_M | ~2.1 GB | 16 GB RAM best (8 GB works) · faster with a GPU |
 
 All three are **Apache-2.0** licensed (see [CREDITS.md](CREDITS.md)) and run on the CPU through
-`node-llama-cpp` — a GPU only makes them faster, it is never required. Models download into the app's
+`node-llama-cpp` — a GPU only makes them faster, it is never required. DevBroom ships the CPU and
+Vulkan backends only; the CUDA builds are deliberately left out because they add ~510 MB to the
+installer and only benefit NVIDIA owners. Inference falls back to the CPU automatically. Models download into the app's
 user-data folder, can be switched or deleted from Settings, and everything runs **on your machine**:
 after the download, the AI helper works with no internet at all.
 

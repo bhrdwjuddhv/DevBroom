@@ -10,6 +10,17 @@ files:
   - dist/**/*
   - src/public/icon.png
   - package.json
+  # node-llama-cpp ships a prebuilt llama.cpp for every backend and architecture. Shipping them all
+  # made the installer ~400 MB, which is absurd for a tool that sells itself on reclaiming disk space.
+  # All three bundled Qwen models are small and CPU-tuned, and node-llama-cpp falls back to the CPU
+  # build automatically when no GPU backend is present (verified: inference works with only *-x64).
+  # CUDA is by far the worst offender (~510 MB on Windows) and only helps NVIDIA owners.
+  - '!**/node_modules/@node-llama-cpp/*-cuda*/**'
+  # Never ship a backend for an architecture this build doesn't target.
+  # NOTE: this must not match mac-arm64-metal, which is the CPU/Metal build macOS actually needs.
+  - '!**/node_modules/@node-llama-cpp/*-arm64/**'
+  - '!**/node_modules/@node-llama-cpp/*-armv7l/**'
+  - '!**/node_modules/@node-llama-cpp/*-riscv64/**'
 
 # Native binaries can't be executed from inside the asar archive.
 asarUnpack:
