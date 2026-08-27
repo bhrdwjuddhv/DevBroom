@@ -24,3 +24,6 @@ config.json
 Thumbs.db
 *.log
 npm-debug.log*
+
+# test fixtures
+.tmp-tests/

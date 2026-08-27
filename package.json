@@ -11,6 +11,7 @@
     "react"
   ],
   "main": "electron/main.js",
+  "desktopName": "devbroom.desktop",
   "author": "Uddhav Bhardwaj (https://github.com/bhrdwjuddhv)",
   "license": "MIT",
   "homepage": "https://github.com/bhrdwjuddhv/DevBroom",

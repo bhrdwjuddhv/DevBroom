@@ -16,8 +16,11 @@ const t = (name, fn) =>
     }
   )
 
+const TMP_ROOT = path.join(__dirname, '..', '.tmp-tests')
+fs.mkdirSync(TMP_ROOT, { recursive: true })
+
 const tmp = (files) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devbroom-ai-'))
+  const root = fs.mkdtempSync(path.join(TMP_ROOT, 'ai-'))
   for (const [p, content] of Object.entries(files)) {
     const full = path.join(root, p)
     fs.mkdirSync(path.dirname(full), { recursive: true })

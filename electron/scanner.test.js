@@ -5,6 +5,13 @@ const os = require('node:os')
 const path = require('node:path')
 const { scan, assertSafePath, toRegex, DEFAULT_RULES, remove } = require('./scanner')
 
+// Fixtures live inside the repo, NOT in os.tmpdir(): on macOS that resolves to /var/folders/...,
+// and the scanner correctly refuses to touch anything under /var. Blocking /var is right, so the
+// test has to move rather than the guard.
+const TMP_ROOT = path.join(__dirname, '..', '.tmp-tests')
+fs.mkdirSync(TMP_ROOT, { recursive: true })
+const mkTmp = (prefix) => fs.mkdtempSync(path.join(TMP_ROOT, prefix))
+
 const t = (name, fn) => fn().then(() => console.log('ok -', name), (e) => { console.error('FAIL -', name, e); process.exitCode = 1 })
 
 // --- safety guards ---
@@ -24,7 +31,7 @@ t('glob patterns match the right names only', async () => {
 
 // --- scan on a throwaway tree ---
 t('scan groups by project, sizes matches, and does not descend into them', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devbroom-'))
+  const root = mkTmp('scan-')
   const mk = (p, bytes) => {
     fs.mkdirSync(path.dirname(path.join(root, p)), { recursive: true })
     fs.writeFileSync(path.join(root, p), Buffer.alloc(bytes))
@@ -47,7 +54,7 @@ t('scan groups by project, sizes matches, and does not descend into them', async
   assert.strictEqual(res.totalBytes, 1500 + 7 + 300)
 
   // delete guard: refuses anything outside the scanned parents
-  const bad = await remove([path.join(os.tmpdir(), 'elsewhere')], { parentFolders: [root] })
+  const bad = await remove([path.join(TMP_ROOT, 'elsewhere')], { parentFolders: [root] })
   assert.strictEqual(bad.deleted.length, 0)
   assert.match(bad.failed[0].reason, /outside/)
 
@@ -55,7 +62,7 @@ t('scan groups by project, sizes matches, and does not descend into them', async
 })
 
 t('lastModified follows source files, not cleanable folders or .git', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devbroom-'))
+  const root = mkTmp('scan-')
   const mk = (p, bytes, mtime) => {
     const full = path.join(root, p)
     fs.mkdirSync(path.dirname(full), { recursive: true })
@@ -76,7 +83,7 @@ t('lastModified follows source files, not cleanable folders or .git', async () =
 })
 
 t('delete streams determinate progress', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devbroom-'))
+  const root = mkTmp('scan-')
   const dirs = ['a/dist', 'b/dist', 'c/dist'].map((d) => path.join(root, d))
   dirs.forEach((d) => {
     fs.mkdirSync(d, { recursive: true })

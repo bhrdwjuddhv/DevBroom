@@ -67,8 +67,9 @@ nsis:
   shortcutName: DevBroom
   runAfterFinish: true
   deleteAppDataOnUninstall: false          # keep settings + reports if they reinstall
-  installerIcon: build/icon.png
-  uninstallerIcon: build/icon.png
+  # No installerIcon/uninstallerIcon here on purpose: makensis needs a real .ico and rejects a
+  # .png outright ("invalid icon file"). Left unset, electron-builder generates a proper
+  # multi-resolution .ico from build/icon.png and uses it for the app and the installer.
   artifactName: ${productName}-Setup-${version}.${ext}
 
 mac:
@@ -87,6 +88,12 @@ linux:
   icon: build/icon.png
   category: Utility
   synopsis: Disk cleanup tool for developers
+  # fpm refuses to build the .deb without a maintainer. This is GitHub's no-reply alias for the
+  # account, not a personal inbox — it is derived from the public username and receives nothing.
+  maintainer: Uddhav Bhardwaj <bhrdwjuddhv@users.noreply.github.com>
+  # Electron uses package.json "desktopName" as app_id / WM_CLASS; without this pair, Linux desktop
+  # environments can't link a running window to the .desktop entry.
+  syncDesktopName: true
   desktop:
     entry:
       Name: DevBroom
