@@ -1,0 +1,96 @@
+appId: com.devbroom.app
+productName: DevBroom
+copyright: Copyright (c) 2026 Uddhav Bhardwaj
+icon: build/icon.png
+
+files:
+  - electron/**/*
+  - '!electron/scanner.test.js'
+  - '!electron/ai.test.js'
+  - dist/**/*
+  - src/public/icon.png
+  - package.json
+
+# Native binaries can't be executed from inside the asar archive.
+asarUnpack:
+  - '**/node_modules/trash/**'
+  - '**/node_modules/node-llama-cpp/**'
+  - '**/node_modules/@node-llama-cpp/**'
+
+directories:
+  output: release
+  buildResources: build
+
+publish:
+  - provider: github
+    owner: bhrdwjuddhv
+    repo: DevBroom
+
+# ---------------------------------------------------------------------------
+# CODE SIGNING (currently disabled — the installer ships unsigned)
+#
+# Without a certificate, Windows SmartScreen shows an "unknown publisher"
+# warning. That is normal for free unsigned open-source apps; see the
+# SmartScreen section in README.md.
+#
+# Once you buy a Windows code-signing certificate, uncomment these under `win:`
+# and set CSC_KEY_PASSWORD in your environment (and as a GitHub secret for CI):
+#
+#   certificateFile: path/to/certificate.pfx
+#   certificatePassword: ${env.CSC_KEY_PASSWORD}
+#   signingHashAlgorithms:
+#     - sha256
+#   rfc3161TimeStampServer: http://timestamp.digicert.com
+#
+# The macOS build is also unsigned. Notarizing it would require a paid Apple
+# Developer account (99 USD/year); until then macOS users must right-click the
+# app and choose Open the first time. If you ever enroll, add under `mac:`
+# hardenedRuntime: true and a notarize block with your Apple team ID.
+#
+# CI note: .github/workflows/release.yml sets CSC_IDENTITY_AUTO_DISCOVERY=false
+# so the unsigned macOS build doesn't fail looking for an identity. Remove that
+# line once you are actually signing.
+# ---------------------------------------------------------------------------
+
+win:
+  target:
+    - nsis
+  icon: build/icon.png
+
+nsis:
+  oneClick: false                          # show a real installer, not a silent one
+  perMachine: false                        # per-user install, so no admin prompt
+  allowElevation: true
+  allowToChangeInstallationDirectory: true # let the user pick the install folder
+  createDesktopShortcut: true              # Desktop shortcut
+  createStartMenuShortcut: true            # Start Menu entry
+  shortcutName: DevBroom
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false          # keep settings + reports if they reinstall
+  installerIcon: build/icon.png
+  uninstallerIcon: build/icon.png
+  artifactName: ${productName}-Setup-${version}.${ext}
+
+mac:
+  target:
+    - dmg
+  icon: build/icon.png
+  category: public.app-category.utilities
+
+dmg:
+  title: DevBroom ${version}
+
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: build/icon.png
+  category: Utility
+  synopsis: Disk cleanup tool for developers
+  desktop:
+    entry:
+      Name: DevBroom
+      Categories: Utility;System;FileTools;
+
+deb:
+  priority: optional

@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+release/
+*.tsbuildinfo
+
+# downloaded AI models (multi-GB, never commit these)
+models/
+*.gguf
+*.gguf.part
+
+# local settings / runtime state
+.env
+.env.local
+config.json
+*.local
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
