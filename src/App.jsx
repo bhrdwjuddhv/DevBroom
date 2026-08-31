@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Settings from './Settings.jsx'
 import Reports from './Reports.jsx'
 import Charts from './Charts.jsx'
@@ -10,17 +10,28 @@ const api = window.devbroom
 const RECENT_DAYS = 7
 const WEEK = 7 * DAY
 
+/** Checkbox that can also render the half-checked state, which React can't express declaratively. */
+function TriCheckbox({ checked, indeterminate, ...rest }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = Boolean(indeterminate) && !checked
+  }, [indeterminate, checked])
+  return <input ref={ref} type="checkbox" checked={checked} {...rest} />
+}
+
 export default function App() {
   const [settings, setSettings] = useState(null)
   const [view, setView] = useState('scan')
+  const [mode, setMode] = useState('redundant') // 'redundant' | 'projects'
   const [scanning, setScanning] = useState(false)
   const [progress, setProgress] = useState(null)
   const [result, setResult] = useState(null)
   const [selected, setSelected] = useState(() => new Set())
   const [collapsed, setCollapsed] = useState(() => new Set())
+  const [search, setSearch] = useState('')
   const [sort, setSort] = useState('size')
   const [confirming, setConfirming] = useState(false)
-  const [ack, setAck] = useState({ permanent: false, recent: false })
+  const [ack, setAck] = useState({ permanent: false, recent: false, projects: false })
   const [deleting, setDeleting] = useState(null)
   const [disk, setDisk] = useState(null)
   const [diskGain, setDiskGain] = useState(null)
@@ -29,16 +40,30 @@ export default function App() {
   const [remind, setRemind] = useState(false)
 
   useEffect(() => {
-    api.getSettings().then((s) => {
+    ;(async () => {
+      const s = await api.getSettings()
       setSettings(s)
       applyTheme(s.theme)
       if (s.weeklyReminder && (!s.lastScan || Date.now() - s.lastScan > WEEK)) {
         setRemind(true)
         api.notify('DevBroom', "It's been a week since your last scan.")
       }
-    })
+
+      // show the previous scan instead of rescanning; only scan unprompted the very first time
+      const cached = await api.lastScan()
+      if (cached?.projects) setResult(cached)
+      else if (s.parentFolders.length) doScan()
+
+      // a delete started before this window reloaded is still running in the main process
+      const running = await api.deleteStatus()
+      if (running) {
+        setDeleting(running)
+        setConfirming(true)
+      }
+    })()
+
     const offScan = api.onScanProgress(setProgress)
-    const offDel = api.onDeleteProgress((p) => setDeleting((d) => ({ ...d, ...p })))
+    const offDel = api.onDeleteProgress((p) => setDeleting(p))
     const offTok = api.onAiToken(({ key, chunk }) =>
       setAi((a) => (a && a.key === key ? { ...a, text: a.text + chunk } : a))
     )
@@ -62,33 +87,61 @@ export default function App() {
   const save = async (patch) => update(await api.setSettings(patch))
 
   const projects = result?.projects ?? []
-  const visible = useMemo(() => {
-    const cutoff = Date.now() - (settings?.oldDays ?? 30) * DAY
-    const filtered = settings?.oldOnly ? projects.filter((p) => (p.lastModified || 0) < cutoff) : projects
-    const size = (p) => p.items.reduce((s, i) => s + i.size, 0)
-    return [...filtered].sort((a, b) =>
-      sort === 'size' ? size(b) - size(a) : a.name.localeCompare(b.name)
-    )
-  }, [projects, sort, settings?.oldOnly, settings?.oldDays])
+  const isProtected = (p) => (settings?.protectedProjects ?? []).includes(p.path)
 
+  // one scan feeds both modes; each mode just filters the same project list differently
+  const visible = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    const cutoff = Date.now() - (settings?.oldDays ?? 30) * DAY
+    let list = projects
+    if (mode === 'redundant') list = list.filter((p) => p.items.length)
+    if (q) list = list.filter((p) => p.name.toLowerCase().includes(q))
+    if (settings?.oldOnly) list = list.filter((p) => (p.lastModified || 0) < cutoff)
+    const size = (p) => (mode === 'projects' ? p.totalBytes : p.items.reduce((s, i) => s + i.size, 0))
+    return [...list].sort((a, b) => (sort === 'size' ? size(b) - size(a) : a.name.localeCompare(b.name)))
+  }, [projects, mode, search, sort, settings?.oldOnly, settings?.oldDays])
+
+  const projectSize = (p) => (mode === 'projects' ? p.totalBytes : p.items.reduce((s, i) => s + i.size, 0))
   const allItems = useMemo(() => visible.flatMap((p) => p.items), [visible])
-  const visibleBytes = allItems.reduce((s, i) => s + i.size, 0)
-  const selectedItems = useMemo(
+  const visibleBytes = visible.reduce((s, p) => s + projectSize(p), 0)
+
+  // what a checkbox actually toggles differs per mode: individual items vs whole project folders
+  const selectablePaths = useMemo(
     () =>
-      visible.flatMap((p) =>
-        p.items.filter((i) => selected.has(i.path)).map((i) => ({ ...i, project: p.name }))
-      ),
-    [visible, selected]
+      visible
+        .filter((p) => !isProtected(p))
+        .flatMap((p) => (mode === 'projects' ? [p.path] : p.items.map((i) => i.path))),
+    [visible, mode, settings?.protectedProjects]
   )
+
+  const selectedItems = useMemo(() => {
+    if (mode === 'projects')
+      return visible
+        .filter((p) => selected.has(p.path) && !isProtected(p))
+        .map((p) => ({
+          path: p.path,
+          name: p.name,
+          size: p.totalBytes,
+          category: 'Whole project',
+          project: p.name,
+          kind: 'project'
+        }))
+    return visible
+      .filter((p) => !isProtected(p))
+      .flatMap((p) =>
+        p.items.filter((i) => selected.has(i.path)).map((i) => ({ ...i, project: p.name, kind: 'item' }))
+      )
+  }, [visible, selected, mode, settings?.protectedProjects])
+
   const selectedBytes = selectedItems.reduce((s, i) => s + i.size, 0)
 
-  // charts follow the selection once you start picking, otherwise show everything visible
   const chartProjects = useMemo(() => {
-    if (!selected.size) return visible
-    return visible
+    const withItems = visible.filter((p) => p.items.length)
+    if (!selected.size || mode === 'projects') return withItems
+    return withItems
       .map((p) => ({ ...p, items: p.items.filter((i) => selected.has(i.path)) }))
       .filter((p) => p.items.length)
-  }, [visible, selected])
+  }, [visible, selected, mode])
 
   const byCategory = useMemo(() => {
     const m = new Map()
@@ -106,8 +159,12 @@ export default function App() {
       return next
     })
   const allSelected = (paths) => paths.length > 0 && paths.every((p) => selected.has(p))
+  const someSelected = (paths) => paths.some((p) => selected.has(p))
   const isRecent = (p) => p.lastModified && Date.now() - p.lastModified < RECENT_DAYS * DAY
-  const touchesRecent = visible.some((p) => isRecent(p) && p.items.some((i) => selected.has(i.path)))
+  const touchesRecent = visible.some(
+    (p) => isRecent(p) && (mode === 'projects' ? selected.has(p.path) : p.items.some((i) => selected.has(i.path)))
+  )
+  const allCollapsed = visible.length > 0 && visible.every((p) => collapsed.has(p.path))
 
   async function doScan() {
     setView('scan')
@@ -121,9 +178,15 @@ export default function App() {
     setScanning(false)
     if (res.error) return setToast({ kind: 'error', text: res.error })
     setResult(res)
-    setSettings((s) => ({ ...s, lastScan: Date.now() }))
+    setSettings((s) => ({ ...s, lastScan: res.at ?? Date.now() }))
     api.diskFree().then(setDisk)
-    if (!res.projects.length) setToast({ kind: 'info', text: 'Nothing cleanable found in those folders.' })
+    if (!res.projects.length) setToast({ kind: 'info', text: 'Nothing found in those folders.' })
+  }
+
+  function openConfirm() {
+    setAck({ permanent: false, recent: false, projects: false })
+    setDeleting(null) // never open on top of a previous run's numbers
+    setConfirming(true)
   }
 
   async function doDelete() {
@@ -131,7 +194,8 @@ export default function App() {
     const res = await api.deleteItems(selectedItems)
     setDeleting(null)
     setConfirming(false)
-    setAck({ permanent: false, recent: false })
+    setAck({ permanent: false, recent: false, projects: false })
+    if (res.error) return setToast({ kind: 'error', text: res.error })
     const failed = res.failed.length ? ` ${res.failed.length} item(s) could not be removed.` : ''
     setToast({
       kind: res.failed.length ? 'error' : 'ok',
@@ -145,9 +209,15 @@ export default function App() {
     await doScan()
   }
 
+  async function toggleProtected(p) {
+    const list = settings.protectedProjects ?? []
+    const next = list.includes(p.path) ? list.filter((x) => x !== p.path) : [...list, p.path]
+    if (!list.includes(p.path)) setSel([p.path, ...p.items.map((i) => i.path)], false)
+    await save({ protectedProjects: next })
+  }
+
   async function askAi(key, projectPath, item) {
     setAi({ key, text: '', loading: true, error: null, facts: null })
-    // facts are read straight off disk, so they land immediately and never depend on the model
     api.aiFacts({ projectPath, item }).then((facts) =>
       setAi((a) => (a && a.key === key ? { ...a, facts } : a))
     )
@@ -181,8 +251,6 @@ export default function App() {
             ×
           </button>
         </header>
-
-        {/* FACTS — read from the project's own files by the app, never written by the model */}
         {ai.facts && (
           <dl className="facts">
             <dt>Detected tech</dt>
@@ -195,7 +263,6 @@ export default function App() {
             )}
           </dl>
         )}
-
         <dl className="facts">
           <dt>Summary</dt>
           <dd>
@@ -209,6 +276,8 @@ export default function App() {
       </div>
     )
 
+  const pct = deleting ? Math.round((deleting.done / Math.max(deleting.total, 1)) * 100) : 0
+
   return (
     <div className="app">
       <header className="topbar">
@@ -218,7 +287,9 @@ export default function App() {
         </div>
         <div className="totals">
           <div className="total-num">{formatBytes(visibleBytes)}</div>
-          <div className="total-label">total space you can recover</div>
+          <div className="total-label">
+            {mode === 'projects' ? 'total size of listed projects' : 'total space you can recover'}
+          </div>
         </div>
         {disk && (
           <div className={`disk ${diskGain ? 'flash' : ''}`}>
@@ -238,17 +309,10 @@ export default function App() {
         <div className="spacer" />
         {view === 'scan' && (
           <>
-            <label className="sortbox">
-              Sort
-              <select value={sort} onChange={(e) => setSort(e.target.value)}>
-                <option value="size">Biggest first</option>
-                <option value="name">Project name</option>
-              </select>
-            </label>
             <div className="selinfo">
               {selected.size} selected · <strong>{formatBytes(selectedBytes)}</strong>
             </div>
-            <button className="danger" disabled={!selected.size || scanning} onClick={() => setConfirming(true)}>
+            <button className="danger" disabled={!selectedItems.length || scanning} onClick={openConfirm}>
               Delete selected
             </button>
           </>
@@ -301,7 +365,7 @@ export default function App() {
             onClick={scanning ? api.cancelScan : doScan}
             disabled={!settings.parentFolders.length}
           >
-            {scanning ? 'Cancel scan' : 'Scan'}
+            {scanning ? 'Cancel scan' : result ? 'Rescan' : 'Scan'}
           </button>
 
           {scanning && (
@@ -326,10 +390,7 @@ export default function App() {
               <span>
                 Only untouched projects
                 <em>
-                  <select
-                    value={settings.oldDays}
-                    onChange={(e) => save({ oldDays: Number(e.target.value) })}
-                  >
+                  <select value={settings.oldDays} onChange={(e) => save({ oldDays: Number(e.target.value) })}>
                     {[30, 60, 90].map((d) => (
                       <option key={d} value={d}>
                         {d}+ days
@@ -343,19 +404,17 @@ export default function App() {
 
           {chartProjects.length > 0 && <Charts projects={chartProjects} accent={settings.theme.accent} />}
 
-          {byCategory.length > 0 && (
+          {byCategory.length > 0 && mode === 'redundant' && (
             <>
-              <h3>Select</h3>
+              <h3>Select a category</h3>
               <ul className="cats">
                 {byCategory.map(([cat, c]) => {
-                  const paths = allItems.filter((i) => i.category === cat).map((i) => i.path)
+                  const paths = visible
+                    .filter((p) => !isProtected(p))
+                    .flatMap((p) => p.items.filter((i) => i.category === cat).map((i) => i.path))
                   return (
                     <li key={cat}>
-                      <button
-                        className="linkish"
-                        onClick={() => setSel(paths, !allSelected(paths))}
-                        title={`Select every ${cat} item`}
-                      >
+                      <button className="linkish" onClick={() => setSel(paths, !allSelected(paths))}>
                         {cat}
                       </button>
                       <span className="csize">{formatBytes(c.size)}</span>
@@ -363,12 +422,6 @@ export default function App() {
                   )
                 })}
               </ul>
-              <button
-                className="wide"
-                onClick={() => setSel(allItems.map((i) => i.path), !allSelected(allItems.map((i) => i.path)))}
-              >
-                {allSelected(allItems.map((i) => i.path)) ? 'Deselect all' : 'Select all'}
-              </button>
             </>
           )}
 
@@ -410,7 +463,7 @@ export default function App() {
           {view === 'settings' ? (
             <Settings settings={settings} onChange={update} />
           ) : view === 'reports' ? (
-            <Reports />
+            <Reports accent={settings.theme.accent} />
           ) : !result ? (
             <div className="empty">
               <h2>Ready when you are</h2>
@@ -419,92 +472,193 @@ export default function App() {
                 node_modules, build output, caches and other regenerable junk — and never touches your source.
               </p>
             </div>
-          ) : visible.length === 0 ? (
-            <div className="empty">
-              <h2>Nothing to show</h2>
-              <p>
-                {settings.oldOnly
-                  ? `No project has been untouched for ${settings.oldDays}+ days. Turn off the filter to see everything.`
-                  : 'No cleanable items were found.'}
-              </p>
-            </div>
           ) : (
-            visible.map((p) => {
-              const paths = p.items.map((i) => i.path)
-              const total = p.items.reduce((s, i) => s + i.size, 0)
-              const isCollapsed = collapsed.has(p.path)
-              return (
-                <section className="project" key={p.path}>
-                  <header>
-                    <input
-                      type="checkbox"
-                      checked={allSelected(paths)}
-                      onChange={(e) => setSel(paths, e.target.checked)}
-                    />
-                    <button
-                      className="collapse"
-                      onClick={() =>
-                        setCollapsed((c) => {
-                          const n = new Set(c)
-                          n.has(p.path) ? n.delete(p.path) : n.add(p.path)
-                          return n
-                        })
-                      }
-                    >
-                      {isCollapsed ? '▸' : '▾'}
-                    </button>
-                    <span className="pname">{p.name}</span>
-                    {isRecent(p) ? (
-                      <span className="badge warn">Edited {ago(p.lastModified)}</span>
-                    ) : (
-                      <span className="badge">Edited {ago(p.lastModified)}</span>
-                    )}
-                    <span className="ppath" title={p.path}>
-                      {p.path}
-                    </span>
-                    <span className="spacer" />
-                    <AiButton id={p.path} projectPath={p.path} />
-                    <button
-                      className="linkish"
-                      onClick={async () => {
-                        update(await api.setSettings({ exclusions: [...new Set([...settings.exclusions, p.path])] }))
-                        setToast({ kind: 'info', text: `Excluded ${p.path}. It will be skipped from now on.` })
-                      }}
-                    >
-                      exclude
-                    </button>
-                    <span className="psize">{formatBytes(total)}</span>
-                  </header>
-                  <AiPanel id={p.path} />
-                  {!isCollapsed && (
-                    <ul className="items">
-                      {[...p.items]
-                        .sort((a, b) => b.size - a.size)
-                        .map((i) => (
-                          <li key={i.path} className={i.safe ? '' : 'review'}>
-                            <input
-                              type="checkbox"
-                              checked={selected.has(i.path)}
-                              onChange={(e) => setSel([i.path], e.target.checked)}
-                            />
-                            <span className="iname">{i.name}</span>
-                            <span className="badge">{i.category}</span>
-                            {!i.safe && <span className="badge warn">review</span>}
-                            <span className="ipath" title={i.path} onClick={() => api.reveal(i.path)}>
-                              {i.path}
+            <>
+              {/* mode switcher + list toolbar */}
+              <div className="modes">
+                {[
+                  ['redundant', 'Redundant Files'],
+                  ['projects', 'Projects']
+                ].map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={mode === id ? 'on' : ''}
+                    onClick={() => {
+                      setMode(id)
+                      setSelected(new Set())
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <span className="spacer" />
+                <span className="muted small">
+                  Last scanned: {result.at ? ago(result.at) : 'unknown'}
+                </span>
+                <button className="tiny" onClick={doScan} disabled={scanning}>
+                  Rescan
+                </button>
+              </div>
+
+              <div className="listbar">
+                <label className="selall">
+                  <TriCheckbox
+                    checked={allSelected(selectablePaths)}
+                    indeterminate={someSelected(selectablePaths)}
+                    disabled={!selectablePaths.length}
+                    onChange={(e) => setSel(selectablePaths, e.target.checked)}
+                  />
+                  Select all
+                </label>
+                <button
+                  className="tiny"
+                  onClick={() =>
+                    setCollapsed(allCollapsed ? new Set() : new Set(visible.map((p) => p.path)))
+                  }
+                >
+                  {allCollapsed ? 'Expand all' : 'Collapse all'}
+                </button>
+                <input
+                  className="searchbox"
+                  placeholder="Search projects by name…"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+                {search && (
+                  <button className="x" onClick={() => setSearch('')} title="Clear search">
+                    ×
+                  </button>
+                )}
+                <span className="spacer" />
+                <label className="sortbox">
+                  Sort
+                  <select value={sort} onChange={(e) => setSort(e.target.value)}>
+                    <option value="size">Biggest first</option>
+                    <option value="name">Project name</option>
+                  </select>
+                </label>
+                <span className="muted small">{visible.length} projects</span>
+              </div>
+
+              {visible.length === 0 ? (
+                <div className="empty">
+                  <h2>Nothing to show</h2>
+                  <p>
+                    {search
+                      ? `No project matches "${search}".`
+                      : settings.oldOnly
+                        ? `No project has been untouched for ${settings.oldDays}+ days.`
+                        : mode === 'redundant'
+                          ? 'No cleanable items were found.'
+                          : 'No projects were found.'}
+                  </p>
+                </div>
+              ) : (
+                visible.map((p) => {
+                  const paths = mode === 'projects' ? [p.path] : p.items.map((i) => i.path)
+                  const locked = isProtected(p)
+                  const isCollapsed = collapsed.has(p.path)
+                  return (
+                    <section className={`project ${locked ? 'locked' : ''}`} key={p.path}>
+                      <header>
+                        <TriCheckbox
+                          checked={!locked && allSelected(paths)}
+                          indeterminate={!locked && someSelected(paths)}
+                          disabled={locked}
+                          onChange={(e) => setSel(paths, e.target.checked)}
+                        />
+                        <button
+                          className="collapse"
+                          onClick={() =>
+                            setCollapsed((c) => {
+                              const n = new Set(c)
+                              n.has(p.path) ? n.delete(p.path) : n.add(p.path)
+                              return n
+                            })
+                          }
+                        >
+                          {isCollapsed ? '▸' : '▾'}
+                        </button>
+                        <button
+                          className={`star ${locked ? 'on' : ''}`}
+                          title={locked ? 'Protected — click to unprotect' : 'Protect this project from deletion'}
+                          onClick={() => toggleProtected(p)}
+                        >
+                          {locked ? '★' : '☆'}
+                        </button>
+                        <span className="pname">{p.name}</span>
+                        {locked && <span className="badge accent">Protected</span>}
+                        <span className={`badge ${isRecent(p) ? 'warn' : ''}`}>Edited {ago(p.lastModified)}</span>
+                        <span className="ppath" title={p.path}>
+                          {p.path}
+                        </span>
+                        <span className="spacer" />
+                        <AiButton id={p.path} projectPath={p.path} />
+                        <button
+                          className="linkish"
+                          onClick={async () => {
+                            update(
+                              await api.setSettings({
+                                exclusions: [...new Set([...settings.exclusions, p.path])]
+                              })
+                            )
+                            setToast({ kind: 'info', text: `Excluded ${p.path} from future scans.` })
+                          }}
+                        >
+                          exclude
+                        </button>
+                        <span className="psize">{formatBytes(projectSize(p))}</span>
+                      </header>
+                      <AiPanel id={p.path} />
+                      {!isCollapsed && mode === 'projects' && (
+                        <ul className="items">
+                          <li className="projmeta">
+                            <span className="muted">
+                              {p.items.length
+                                ? `${p.items.length} cleanable item(s) inside · ${formatBytes(
+                                    p.items.reduce((s, i) => s + i.size, 0)
+                                  )} of it is regenerable`
+                                : 'No cleanable items inside — this is all source.'}
                             </span>
-                            <AiButton id={i.path} projectPath={p.path} item={i} />
-                            <span className="isize">{formatBytes(i.size)}</span>
+                            <span className="spacer" />
+                            <span className="ipath" onClick={() => api.reveal(p.path)}>
+                              open folder
+                            </span>
                           </li>
-                        ))}
-                    </ul>
-                  )}
-                  {p.items.map((i) => (
-                    <AiPanel key={i.path} id={i.path} />
-                  ))}
-                </section>
-              )
-            })
+                        </ul>
+                      )}
+                      {!isCollapsed && mode === 'redundant' && (
+                        <ul className="items">
+                          {[...p.items]
+                            .sort((a, b) => b.size - a.size)
+                            .map((i) => (
+                              <li key={i.path} className={i.safe ? '' : 'review'}>
+                                <input
+                                  type="checkbox"
+                                  checked={selected.has(i.path)}
+                                  disabled={locked}
+                                  onChange={(e) => setSel([i.path], e.target.checked)}
+                                />
+                                <span className="iname">{i.name}</span>
+                                <span className="badge">{i.category}</span>
+                                {!i.safe && <span className="badge warn">review</span>}
+                                <span className="ipath" title={i.path} onClick={() => api.reveal(i.path)}>
+                                  {i.path}
+                                </span>
+                                <AiButton id={i.path} projectPath={p.path} item={i} />
+                                <span className="isize">{formatBytes(i.size)}</span>
+                              </li>
+                            ))}
+                        </ul>
+                      )}
+                      {!isCollapsed &&
+                        mode === 'redundant' &&
+                        p.items.map((i) => <AiPanel key={i.path} id={i.path} />)}
+                    </section>
+                  )
+                })
+              )}
+            </>
           )}
         </main>
       </div>
@@ -516,32 +670,57 @@ export default function App() {
               <>
                 <h2>{settings.permanentDelete ? 'Deleting…' : 'Moving to Recycle Bin…'}</h2>
                 <p>
-                  {Math.min(deleting.done + 1, deleting.total)} of {deleting.total} ·{' '}
-                  {Math.round((deleting.done / Math.max(deleting.total, 1)) * 100)}%
+                  {Math.min(deleting.done + 1, deleting.total)} of {deleting.total} · {pct}%
                 </p>
                 <div className="track">
-                  <div style={{ width: `${(deleting.done / Math.max(deleting.total, 1)) * 100}%` }} />
+                  <div style={{ width: `${pct}%` }} />
                 </div>
                 <div className="delcurrent" title={deleting.current}>
                   {deleting.current || 'finishing up…'}
                 </div>
+                <p className="muted small" style={{ marginTop: 10 }}>
+                  This runs in the background — minimising or closing this window will not stop it.
+                </p>
               </>
             ) : (
               <>
-                <h2>{settings.permanentDelete ? 'Permanently delete?' : 'Move to Recycle Bin?'}</h2>
+                <h2>
+                  {mode === 'projects'
+                    ? settings.permanentDelete
+                      ? 'Permanently delete entire projects?'
+                      : 'Delete entire projects?'
+                    : settings.permanentDelete
+                      ? 'Permanently delete?'
+                      : 'Move to Recycle Bin?'}
+                </h2>
                 <p>
-                  <strong>{selected.size}</strong> item(s), freeing <strong>{formatBytes(selectedBytes)}</strong>.
+                  <strong>{selectedItems.length}</strong>{' '}
+                  {mode === 'projects' ? 'project folder(s)' : 'item(s)'}, freeing{' '}
+                  <strong>{formatBytes(selectedBytes)}</strong>.
                 </p>
                 <ul className="preview">
                   {selectedItems.slice(0, 8).map((i) => (
                     <li key={i.path}>
-                      {i.path} <span className="isize">{formatBytes(i.size)}</span>
+                      {mode === 'projects' ? i.name : i.path}{' '}
+                      <span className="isize">{formatBytes(i.size)}</span>
                     </li>
                   ))}
                   {selectedItems.length > 8 && (
                     <li className="muted">…and {selectedItems.length - 8} more</li>
                   )}
                 </ul>
+
+                {mode === 'projects' && (
+                  <label className="ackbox" style={{ marginBottom: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={ack.projects}
+                      onChange={(e) => setAck({ ...ack, projects: e.target.checked })}
+                    />
+                    This deletes the <strong>entire project folder</strong>, source code included — not just
+                    the regenerable parts. I have checked the list above.
+                  </label>
+                )}
                 {touchesRecent && (
                   <label className="ackbox" style={{ marginBottom: 8 }}>
                     <input
@@ -571,7 +750,11 @@ export default function App() {
                   <button onClick={() => setConfirming(false)}>Cancel</button>
                   <button
                     className="danger"
-                    disabled={(settings.permanentDelete && !ack.permanent) || (touchesRecent && !ack.recent)}
+                    disabled={
+                      (settings.permanentDelete && !ack.permanent) ||
+                      (touchesRecent && !ack.recent) ||
+                      (mode === 'projects' && !ack.projects)
+                    }
                     onClick={doDelete}
                   >
                     {settings.permanentDelete ? 'Delete forever' : 'Move to Recycle Bin'}

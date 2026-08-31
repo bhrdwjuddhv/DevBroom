@@ -36,8 +36,7 @@ It is fully offline, has zero telemetry, and the whole thing is about 1,500 line
 | Cleanup reports | Local AI helper |
 | --- | --- |
 | ![Reports](./assets/screenshot-reports.png) | ![AI helper](./assets/screenshot-ai.png) |
-
-> Screenshots live in [`./assets`](./assets). Replace the placeholders above with your own captures. -->
+ -->
 
 ## Features
 

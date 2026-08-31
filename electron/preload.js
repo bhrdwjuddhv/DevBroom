@@ -14,10 +14,13 @@ contextBridge.exposeInMainWorld('devbroom', {
   addExclusion: () => ipcRenderer.invoke('folders:pickExclusion'),
 
   scan: () => ipcRenderer.invoke('scan:start'),
+  lastScan: () => ipcRenderer.invoke('scan:last'),
+  clearScanCache: () => ipcRenderer.invoke('scan:clearCache'),
   cancelScan: () => ipcRenderer.invoke('scan:cancel'),
   onScanProgress: (cb) => on('scan:progress', cb),
 
   deleteItems: (items) => ipcRenderer.invoke('items:delete', items),
+  deleteStatus: () => ipcRenderer.invoke('delete:status'),
   onDeleteProgress: (cb) => on('delete:progress', cb),
 
   diskFree: (target) => ipcRenderer.invoke('disk:free', target),

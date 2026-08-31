@@ -160,6 +160,7 @@ async function scan(parentFolders, opts = {}) {
       if (excluded(projectPath)) continue
       const items = []
       let lastModified = 0 // newest mtime of real source files, cleanable folders excluded
+      let otherBytes = 0 // everything that is NOT a cleanable item, so we can total the project
 
       const walk = async (dir) => {
         if (cancelled()) return
@@ -207,19 +208,29 @@ async function scan(parentFolders, opts = {}) {
             continue // matched folders are recorded, never walked into
           }
           if (kind === 'folder') {
-            if (!SKIP_DIRS.has(e.name)) await walk(full)
+            if (SKIP_DIRS.has(e.name)) {
+              // not walked for rules or mtime, but its bytes still belong to the project total
+              otherBytes += await dirSize(full, onError)
+            } else await walk(full)
           } else {
             try {
-              const m = (await fs.lstat(full)).mtimeMs
-              if (m > lastModified) lastModified = m
+              const st = await fs.lstat(full)
+              otherBytes += st.size
+              if (st.mtimeMs > lastModified) lastModified = st.mtimeMs
             } catch {} // an unreadable file just doesn't count toward "last edited"
           }
         }
       }
 
       await walk(projectPath)
-      if (items.length)
-        projects.push({ name: path.basename(projectPath), path: projectPath, items, lastModified })
+      projects.push({
+        name: path.basename(projectPath),
+        path: projectPath,
+        items,
+        lastModified,
+        // total size of the whole project folder, cleanable items included
+        totalBytes: otherBytes + items.reduce((sum, i) => sum + i.size, 0)
+      })
       progress(projectPath)
     }
   }
@@ -244,7 +255,7 @@ async function sendToTrash(target) {
  * Moves paths to Trash (or permanently deletes when permanent === true). Returns bytes actually freed.
  * onProgress({ done, total, current }) fires before each item so the UI can show a determinate bar.
  */
-async function remove(paths, { permanent = false, parentFolders = [], onProgress } = {}) {
+async function remove(paths, { permanent = false, parentFolders = [], protectedPaths = [], onProgress } = {}) {
   const results = { freed: 0, deleted: [], failed: [] }
   const targets = []
 
@@ -255,6 +266,8 @@ async function remove(paths, { permanent = false, parentFolders = [], onProgress
         throw new Error('refusing to delete a scanned parent folder')
       if (parentFolders.length && !parentFolders.some((pf) => isInside(full, pf)))
         throw new Error('outside every scanned folder')
+      // enforced here so a UI bug can never delete something the user marked protected
+      if (protectedPaths.some((pp) => isInside(full, pp))) throw new Error('project is protected')
       const st = await fs.lstat(full)
       if (st.isSymbolicLink()) throw new Error('symbolic link, skipped')
       const size = st.isDirectory() ? await dirSize(full) : st.size

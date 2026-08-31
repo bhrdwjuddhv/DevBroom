@@ -103,3 +103,51 @@ t('delete streams determinate progress', async () => {
 
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+t('every project is returned with a full folder size, and protected projects are refused', async () => {
+  const root = mkTmp('scan-')
+  const mk = (p, bytes) => {
+    const full = path.join(root, p)
+    fs.mkdirSync(path.dirname(full), { recursive: true })
+    fs.writeFileSync(full, Buffer.alloc(bytes))
+  }
+  mk('with-junk/package.json', 10)
+  mk('with-junk/src/app.js', 90)
+  mk('with-junk/node_modules/big.bin', 400)
+  mk('with-junk/.git/objects/abc', 50)
+  mk('clean/package.json', 10)
+  mk('clean/src/only-source.js', 25)
+
+  const res = await scan([root], { rules: DEFAULT_RULES })
+  const names = res.projects.map((p) => p.name).sort()
+  // Projects mode needs projects that have nothing cleanable in them too
+  assert.deepStrictEqual(names, ['clean', 'with-junk'])
+
+  const junk = res.projects.find((p) => p.name === 'with-junk')
+  // whole-folder size: source + .git + the cleanable folder
+  assert.strictEqual(junk.totalBytes, 10 + 90 + 50 + 400)
+  assert.strictEqual(res.projects.find((p) => p.name === 'clean').totalBytes, 35)
+  // the scan total still counts only what is recoverable
+  assert.strictEqual(res.totalBytes, 400)
+
+  // a protected project cannot be deleted even if the UI asks for it
+  const blocked = await remove([junk.path], {
+    permanent: true,
+    parentFolders: [root],
+    protectedPaths: [junk.path]
+  })
+  assert.strictEqual(blocked.deleted.length, 0)
+  assert.match(blocked.failed[0].reason, /protected/)
+  assert.ok(fs.existsSync(junk.path), 'protected project must still exist')
+
+  // and a file inside a protected project is refused too, not just the folder itself
+  const inside = await remove([path.join(junk.path, 'node_modules')], {
+    permanent: true,
+    parentFolders: [root],
+    protectedPaths: [junk.path]
+  })
+  assert.strictEqual(inside.deleted.length, 0)
+  assert.match(inside.failed[0].reason, /protected/)
+
+  fs.rmSync(root, { recursive: true, force: true })
+})

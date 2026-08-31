@@ -1,1 +1,0 @@
-Screenshots go here. See README.md.

@@ -5,6 +5,18 @@ const { DEFAULT_RULES, CATEGORY_NOTES, assertSafePath, scan, remove } = require(
 const ai = require('./ai')
 
 const DEV_URL = process.env.VITE_DEV_URL
+
+/**
+ * Fire-and-forget message to the renderer.
+ * webContents.send() THROWS once the renderer is gone (closed, or reloaded by HMR in dev). That
+ * exception used to escape remove()'s loop and abort a running delete, which is what made deletes
+ * look like they "cancel when you minimize". Progress reporting must never be able to do that.
+ */
+const emit = (channel, payload) => {
+  try {
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send(channel, payload)
+  } catch {}
+}
 const ICON = path.join(__dirname, '..', 'src', 'public', 'icon.png')
 let store
 let win
@@ -21,6 +33,8 @@ const defaults = {
   weeklyReminder: false,
   lastScan: null,
   aiModel: null,
+  protectedProjects: [],
+  windowBounds: null,
   reports: []
 }
 
@@ -57,10 +71,11 @@ const publicSettings = () => {
 }
 
 function createWindow() {
+  const saved = readSettings().windowBounds
   win = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    ...(saved ?? { width: 1280, height: 820 }),
     minWidth: 960,
+    minHeight: 600,
     backgroundColor: '#000000',
     title: 'DevBroom',
     icon: ICON,
@@ -68,8 +83,17 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      // keep the progress UI ticking while the window is minimised or behind another app
+      backgroundThrottling: false
     }
+  })
+
+  // remember where the window was; 'close' fires before the bounds are gone
+  win.on('close', () => {
+    try {
+      if (!win.isMinimized() && !win.isFullScreen()) store.set('windowBounds', win.getNormalBounds())
+    } catch {}
   })
   if (DEV_URL) {
     // surface renderer/preload problems in the terminal running `npm run dev`
@@ -130,6 +154,24 @@ ipcMain.handle('folders:pickExclusion', async () => {
   return publicSettings()
 })
 
+// ---------- scan cache ----------
+// Results can be a few MB, so they live in their own file rather than bloating the settings store.
+const cacheFile = () => path.join(app.getPath('userData'), 'scan-cache.json')
+
+async function readCache() {
+  try {
+    return JSON.parse(await fs.readFile(cacheFile(), 'utf8'))
+  } catch {
+    return null // no scan yet, or the file is unreadable/corrupt — treat both as "never scanned"
+  }
+}
+
+ipcMain.handle('scan:last', () => readCache())
+ipcMain.handle('scan:clearCache', async () => {
+  await fs.rm(cacheFile(), { force: true }).catch(() => {})
+  return null
+})
+
 // ---------- scan ----------
 ipcMain.handle('scan:start', async (e) => {
   const s = readSettings()
@@ -145,10 +187,17 @@ ipcMain.handle('scan:start', async (e) => {
         const now = Date.now()
         if (now - last < 80) return // ponytail: throttle so IPC doesn't drown the renderer
         last = now
-        e.sender.send('scan:progress', p)
+        emit('scan:progress', p)
       }
     })
-    if (!res.cancelled) store.set('lastScan', Date.now())
+    if (!res.cancelled) {
+      const at = Date.now()
+      store.set('lastScan', at)
+      // cached so reopening the app shows the last results instead of rescanning
+      const payload = { ...res, at, folders: s.parentFolders }
+      await fs.writeFile(cacheFile(), JSON.stringify(payload)).catch(() => {})
+      return payload
+    }
     return res
   } catch (err) {
     return { error: err.message }
@@ -160,25 +209,49 @@ ipcMain.handle('scan:cancel', () => {
 })
 
 // ---------- delete ----------
-ipcMain.handle('items:delete', async (e, items) => {
+// Progress state lives HERE, not in the renderer. A delete keeps running regardless of whether the
+// window is focused, minimised, hidden or reloaded, and reopening the popup reads the real state.
+let deleteState = null
+
+ipcMain.handle('delete:status', () => deleteState)
+
+ipcMain.handle('items:delete', async (_e, items) => {
+  if (deleteState) return { error: 'A cleanup is already running.' }
   const s = readSettings()
   const paths = items.map((i) => i.path)
+  const startedAt = Date.now()
   const before = await freeSpaceFor(paths[0] ?? s.parentFolders[0])
 
-  const res = await remove(paths, {
-    permanent: s.permanentDelete,
-    parentFolders: s.parentFolders,
-    onProgress: (p) => e.sender.send('delete:progress', p)
-  })
+  // reset before anything else so a new run can never show the previous run's numbers
+  deleteState = { done: 0, total: items.length, current: '', startedAt }
+  emit('delete:progress', deleteState)
 
+  let res
+  try {
+    res = await remove(paths, {
+      permanent: s.permanentDelete,
+      parentFolders: s.parentFolders,
+      protectedPaths: s.protectedProjects,
+      onProgress: (p) => {
+        deleteState = { ...p, startedAt }
+        emit('delete:progress', deleteState)
+      }
+    })
+  } finally {
+    deleteState = null // cleared on success AND on failure, so the popup always opens fresh
+  }
+
+  const durationMs = Date.now() - startedAt
   const after = await freeSpaceFor(paths[0] ?? s.parentFolders[0])
   const byPath = new Map(items.map((i) => [i.path, i]))
   const deleted = res.deleted.map((d) => ({ ...byPath.get(d.path), ...d }))
 
   const report = {
     id: String(Date.now()),
-    at: Date.now(),
+    at: startedAt,
+    durationMs,
     destination: s.permanentDelete ? 'Permanently deleted' : 'Recycle Bin / Trash',
+    mode: items[0]?.kind === 'project' ? 'Projects' : 'Redundant files',
     freed: res.freed,
     items: deleted.map((d) => ({
       path: d.path,
@@ -228,7 +301,7 @@ ipcMain.handle('reports:clear', () => {
 ipcMain.handle('ai:list', () => ai.list())
 ipcMain.handle('ai:download', async (e, id) => {
   try {
-    await ai.download(id, (p) => e.sender.send('ai:download-progress', { id, ...p }))
+    await ai.download(id, (p) => emit('ai:download-progress', { id, ...p }))
     if (!readSettings().aiModel) store.set('aiModel', id)
     return { ok: true, models: ai.list() }
   } catch (err) {
@@ -250,7 +323,7 @@ ipcMain.handle('ai:explain', async (e, payload) => {
     return { error: 'No local model selected. Download one in Settings → Project AI Helper.' }
   try {
     const { facts, summary } = await ai.explain({ ...payload, modelId }, (chunk) =>
-      e.sender.send('ai:token', { key: payload.key, chunk })
+      emit('ai:token', { key: payload.key, chunk })
     )
     return { facts, summary }
   } catch (err) {

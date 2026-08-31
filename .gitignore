@@ -27,3 +27,7 @@ npm-debug.log*
 
 # test fixtures
 .tmp-tests/
+assets/screenshot-ai.png
+assets/screenshot-reports.png
+assets/screenshot-results.png
+assets/screenshot-settings.png
