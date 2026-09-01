@@ -90,10 +90,29 @@ function createWindow() {
   })
 
   // remember where the window was; 'close' fires before the bounds are gone
-  win.on('close', () => {
+  win.on('close', (e) => {
     try {
       if (!win.isMinimized() && !win.isFullScreen()) store.set('windowBounds', win.getNormalBounds())
     } catch {}
+
+    // Closing must stop a running cleanup — but ask first, and never act on a minimise.
+    if (deleteState && !pendingClose) {
+      e.preventDefault()
+      const choice = dialog.showMessageBoxSync(win, {
+        type: 'warning',
+        buttons: ['Stop and close', 'Keep cleaning'],
+        defaultId: 1,
+        cancelId: 1,
+        title: 'Cleanup in progress',
+        message: 'A cleanup is running — stop it and close?',
+        detail:
+          'Items already moved to the Recycle Bin stay there. Nothing further will be deleted, and the window closes once the item in progress finishes.'
+      })
+      if (choice === 0) {
+        cancelDelete = true
+        pendingClose = true
+      }
+    }
   })
   if (DEV_URL) {
     // surface renderer/preload problems in the terminal running `npm run dev`
@@ -209,20 +228,59 @@ ipcMain.handle('scan:cancel', () => {
 })
 
 // ---------- delete ----------
-// Progress state lives HERE, not in the renderer. A delete keeps running regardless of whether the
-// window is focused, minimised, hidden or reloaded, and reopening the popup reads the real state.
+// Progress and cancellation live HERE, not in the renderer. A delete keeps running regardless of
+// whether the window is focused, minimised, hidden or reloaded. Only the Stop button and an
+// explicit window-close request cancel it — minimising never does.
 let deleteState = null
+let cancelDelete = false
+let pendingClose = false
+
+const dlog = (...args) => console.log('[delete]', ...args)
 
 ipcMain.handle('delete:status', () => deleteState)
+ipcMain.handle('delete:cancel', () => {
+  if (deleteState) {
+    dlog('stop requested — finishing the item in flight, then stopping')
+    cancelDelete = true
+  }
+  return true
+})
+
+/** Keep the cached scan honest: drop exactly the paths that were confirmed deleted. */
+async function pruneCache(deletedPaths) {
+  const cache = await readCache()
+  if (!cache?.projects) return
+  const key = (p) => (process.platform === 'win32' ? p.toLowerCase() : p)
+  const gone = new Set(deletedPaths.map(key))
+
+  cache.projects = cache.projects
+    .filter((pr) => !gone.has(key(pr.path)))
+    .map((pr) => {
+      const removed = pr.items.filter((i) => gone.has(key(i.path)))
+      if (!removed.length) return pr
+      return {
+        ...pr,
+        items: pr.items.filter((i) => !gone.has(key(i.path))),
+        totalBytes: Math.max(0, (pr.totalBytes ?? 0) - removed.reduce((s, i) => s + i.size, 0))
+      }
+    })
+  cache.totalBytes = cache.projects.reduce(
+    (s, pr) => s + pr.items.reduce((a, i) => a + i.size, 0),
+    0
+  )
+  await fs.writeFile(cacheFile(), JSON.stringify(cache)).catch((e) => dlog('cache write failed', e.message))
+}
 
 ipcMain.handle('items:delete', async (_e, items) => {
   if (deleteState) return { error: 'A cleanup is already running.' }
   const s = readSettings()
   const paths = items.map((i) => i.path)
   const startedAt = Date.now()
+  dlog(`starting: ${items.length} item(s), permanent=${s.permanentDelete}`)
   const before = await freeSpaceFor(paths[0] ?? s.parentFolders[0])
 
   // reset before anything else so a new run can never show the previous run's numbers
+  cancelDelete = false
   deleteState = { done: 0, total: items.length, current: '', startedAt }
   emit('delete:progress', deleteState)
 
@@ -232,16 +290,32 @@ ipcMain.handle('items:delete', async (_e, items) => {
       permanent: s.permanentDelete,
       parentFolders: s.parentFolders,
       protectedPaths: s.protectedProjects,
+      shouldCancel: () => cancelDelete,
+      log: dlog,
+      // streamed per item so the dashboard can drop each one the moment it is confirmed gone
+      onItem: (item) => emit('delete:item', item),
       onProgress: (p) => {
         deleteState = { ...p, startedAt }
         emit('delete:progress', deleteState)
       }
     })
+  } catch (err) {
+    // remove() handles per-item errors itself; reaching here means something unexpected broke
+    console.error('[delete] FATAL', err)
+    deleteState = null
+    return { error: `Cleanup failed: ${err.message}` }
   } finally {
     deleteState = null // cleared on success AND on failure, so the popup always opens fresh
   }
 
   const durationMs = Date.now() - startedAt
+  dlog(
+    `done in ${durationMs}ms — deleted ${res.deleted.length}, failed ${res.failed.length}, skipped ${res.skipped.length}${res.cancelled ? ' (stopped early)' : ''}`
+  )
+  res.failed.forEach((f) => console.error('[delete] failed:', f.path, '—', f.reason))
+
+  await pruneCache(res.deleted.map((d) => d.path))
+
   const after = await freeSpaceFor(paths[0] ?? s.parentFolders[0])
   const byPath = new Map(items.map((i) => [i.path, i]))
   const deleted = res.deleted.map((d) => ({ ...byPath.get(d.path), ...d }))
@@ -252,6 +326,7 @@ ipcMain.handle('items:delete', async (_e, items) => {
     durationMs,
     destination: s.permanentDelete ? 'Permanently deleted' : 'Recycle Bin / Trash',
     mode: items[0]?.kind === 'project' ? 'Projects' : 'Redundant files',
+    stopped: res.cancelled,
     freed: res.freed,
     items: deleted.map((d) => ({
       path: d.path,
@@ -261,10 +336,19 @@ ipcMain.handle('items:delete', async (_e, items) => {
       project: d.project ?? path.dirname(d.path)
     })),
     failed: res.failed,
+    skipped: res.skipped,
     diskBefore: before,
     diskAfter: after
   }
-  store.set('reports', [report, ...readSettings().reports].slice(0, 200))
+  // a run that deleted nothing at all is noise in the history, but a partial run is worth keeping
+  if (report.items.length || report.failed.length) {
+    store.set('reports', [report, ...readSettings().reports].slice(0, 200))
+  }
+
+  if (pendingClose && win && !win.isDestroyed()) {
+    dlog('cleanup stopped for window close — closing now')
+    win.close()
+  }
   return { ...res, report }
 })
 

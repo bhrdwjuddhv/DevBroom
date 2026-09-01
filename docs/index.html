@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DevBroom — sweep the dead weight out of your dev machine</title>
+    <meta
+      name="description"
+      content="DevBroom is a free, open-source disk cleanup tool for developers. Find node_modules, build output and caches across every project, and sweep them to the Recycle Bin safely."
+    />
+    <link rel="icon" href="./assets/icon.png" />
+
+    <!-- Open Graph / social preview -->
+    <meta property="og:title" content="DevBroom — disk cleanup for developers" />
+    <meta
+      property="og:description"
+      content="Find node_modules, build output and caches across every project. Safe, offline, open source."
+    />
+    <meta property="og:image" content="./assets/screenshot-results.png" />
+    <meta property="og:type" content="website" />
+
+    <!-- Instrument Sans, matching the app. Falls back to the system stack offline. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <style>
+      /* Same design tokens as the app itself */
+      :root {
+        --accent: #c90003;
+        --glow: #660808;
+        --bg: #000000;
+        --surface: rgb(21, 21, 21);
+        --surface-2: rgb(29, 29, 29);
+        --line: rgba(255, 255, 255, 0.06);
+        --line-strong: rgba(255, 255, 255, 0.14);
+        --text: rgb(219, 219, 219);
+        --dim: rgb(125, 125, 125);
+        --btn: linear-gradient(rgb(21, 21, 21) 0%, rgb(29, 29, 29) 100%);
+        --font: 'Instrument Sans', ui-sans-serif, system-ui, 'Segoe UI', Roboto, sans-serif;
+        --mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
+        color-scheme: dark;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 16px/1.6 var(--font);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      .wrap { width: min(1080px, 92vw); margin: 0 auto; }
+
+      /* ---------- nav ---------- */
+      nav {
+        position: sticky; top: 0; z-index: 10;
+        background: rgba(0, 0, 0, 0.78);
+        backdrop-filter: blur(10px);
+        border-bottom: 1px solid var(--line);
+      }
+      nav .wrap { display: flex; align-items: center; gap: 14px; padding: 14px 0; }
+      .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: .2px; }
+      .brand img { width: 28px; height: 28px; border-radius: 7px; }
+      nav .links { margin-left: auto; display: flex; gap: 22px; align-items: center; }
+      nav .links a { color: var(--dim); font-size: 14px; }
+      nav .links a:hover { color: var(--text); text-decoration: none; }
+
+      /* ---------- buttons ---------- */
+      .btn {
+        display: inline-flex; align-items: center; gap: 9px;
+        padding: 13px 26px; border-radius: 9px;
+        border: 1px solid var(--line-strong); background: var(--btn);
+        color: var(--text); font-weight: 600; font-size: 15px;
+        transition: border-color .18s, box-shadow .18s, transform .18s;
+      }
+      .btn:hover { border-color: var(--accent); transform: translateY(-1px); text-decoration: none; }
+      .btn.primary {
+        background: var(--accent); border-color: var(--accent); color: #fff;
+        box-shadow: 0 0 22px -4px var(--glow);
+      }
+      .btn.primary:hover { box-shadow: 0 0 34px -2px var(--glow); }
+
+      /* ---------- hero ---------- */
+      header.hero { position: relative; overflow: hidden; padding: 96px 0 72px; text-align: center; }
+      header.hero::before {
+        content: ''; position: absolute; top: -260px; left: 50%; transform: translateX(-50%);
+        width: 760px; height: 520px; border-radius: 50%;
+        background: radial-gradient(circle, var(--glow) 0%, transparent 68%);
+        opacity: .55; pointer-events: none;
+      }
+      .hero .wrap { position: relative; }
+      .hero .pill {
+        display: inline-block; margin-bottom: 22px; padding: 5px 15px; border-radius: 999px;
+        border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+        color: var(--accent); font-size: 12.5px; font-weight: 600; letter-spacing: .3px;
+      }
+      .hero h1 {
+        margin: 0 0 18px; font-size: clamp(42px, 7vw, 76px); line-height: 1.04;
+        font-weight: 700; letter-spacing: -1.6px;
+      }
+      .hero h1 span { color: var(--accent); text-shadow: 0 0 34px var(--glow); }
+      .hero p.tag {
+        margin: 0 auto 34px; max-width: 620px; font-size: clamp(17px, 2.2vw, 20px); color: var(--dim);
+      }
+      .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+      .subtle { margin-top: 16px; font-size: 13px; color: var(--dim); }
+
+      /* ---------- shots ---------- */
+      .shot {
+        margin: 56px auto 0; border-radius: 14px; overflow: hidden;
+        border: 1px solid var(--line-strong); background: var(--surface);
+        box-shadow: 0 30px 80px -30px rgba(0, 0, 0, .95);
+      }
+      .shot img { display: block; width: 100%; height: auto; }
+
+      section { padding: 84px 0; border-top: 1px solid var(--line); }
+      h2.section { margin: 0 0 12px; font-size: clamp(27px, 3.6vw, 38px); letter-spacing: -.8px; }
+      p.lede { margin: 0 0 44px; color: var(--dim); max-width: 620px; font-size: 17px; }
+
+      /* ---------- features ---------- */
+      .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(272px, 1fr)); }
+      .card {
+        padding: 26px; border-radius: 13px;
+        background: var(--surface); border: 1px solid var(--line);
+        transition: border-color .18s, transform .18s;
+      }
+      .card:hover { border-color: color-mix(in srgb, var(--accent) 55%, transparent); transform: translateY(-3px); }
+      .card .ico {
+        width: 42px; height: 42px; margin-bottom: 15px; border-radius: 10px;
+        display: grid; place-items: center; font-size: 20px;
+        background: color-mix(in srgb, var(--accent) 14%, transparent);
+        border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+      }
+      .card h3 { margin: 0 0 8px; font-size: 17.5px; }
+      .card p { margin: 0; color: var(--dim); font-size: 14.5px; }
+
+      /* ---------- steps ---------- */
+      .steps { counter-reset: step; display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(272px, 1fr)); }
+      .step { position: relative; padding: 26px 26px 26px 68px; border-radius: 13px; background: var(--surface); border: 1px solid var(--line); }
+      .step::before {
+        counter-increment: step; content: counter(step);
+        position: absolute; left: 22px; top: 24px;
+        width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+        background: var(--accent); color: #fff; font-weight: 700; font-size: 15px;
+        box-shadow: 0 0 18px -2px var(--glow);
+      }
+      .step h3 { margin: 0 0 6px; font-size: 17px; }
+      .step p { margin: 0; color: var(--dim); font-size: 14.5px; }
+
+      .shots { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); }
+      /* an odd third capture spans both columns instead of hanging in a half-empty row */
+      .shots > figure:last-child:nth-child(odd) { grid-column: 1 / -1; }
+      .shots a { display: block; cursor: zoom-in; }
+      .shots a:hover { text-decoration: none; }
+      .shots .shot { margin: 0; transition: border-color .18s, transform .18s; }
+      .shots .shot:hover { border-color: color-mix(in srgb, var(--accent) 55%, transparent); transform: translateY(-3px); }
+      .shots figcaption { padding: 11px 14px; font-size: 13px; color: var(--dim); border-top: 1px solid var(--line); }
+
+      /* ---------- footer ---------- */
+      footer { border-top: 1px solid var(--line); padding: 44px 0; color: var(--dim); font-size: 14px; }
+      footer .wrap { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+      footer .spacer { flex: 1; }
+
+      @media (max-width: 640px) {
+        nav .links a:not(.btn) { display: none; }
+        header.hero { padding: 62px 0 48px; }
+        section { padding: 62px 0; }
+      }
+    </style>
+  </head>
+
+  <body>
+    <nav>
+      <div class="wrap">
+        <a class="brand" href="#top">
+          <!-- Drop your icon at docs/assets/icon.png -->
+          <img src="./assets/icon.png" alt="" onerror="this.style.display='none'" />
+          DevBroom
+        </a>
+        <div class="links">
+          <a href="#features">Features</a>
+          <a href="#how">How it works</a>
+          <a href="#shots">Screenshots</a>
+          <a href="https://github.com/bhrdwjuddhv/DevBroom">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero" id="top">
+      <div class="wrap">
+        <span class="pill">Free &amp; open source · Windows · macOS · Linux</span>
+        <h1>Sweep the dead weight<br />out of your <span>dev machine</span>.</h1>
+        <p class="tag">
+          Every project you own is hoarding gigabytes of <code>node_modules</code>, build output and
+          caches you will never read again. DevBroom finds all of it, shows you exactly what it costs,
+          and sweeps only what you tick — to the Recycle Bin, never into the void.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/bhrdwjuddhv/DevBroom/releases/latest">
+            ↓ Download for free
+          </a>
+          <a class="btn" href="https://github.com/bhrdwjuddhv/DevBroom">★ Star on GitHub</a>
+        </div>
+        <p class="subtle">No account, no telemetry, no network calls. Runs entirely on your machine.</p>
+
+        <figure class="shot">
+          <img
+            src="./assets/screenshot-results.png"
+            width="1672"
+            height="941"
+            alt="DevBroom scan results: 10 GB of node_modules, dist folders and caches grouped by project, with a category donut and top-projects chart in the sidebar."
+          />
+        </figure>
+      </div>
+    </header>
+
+    <section id="features">
+      <div class="wrap">
+        <h2 class="section">Built for how developers actually work</h2>
+        <p class="lede">
+          Point it at the folder your projects live in. One scan powers everything below.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <div class="ico">🔍</div>
+            <h3>Scans by project</h3>
+            <p>
+              Anything with a <code>package.json</code> or <code>.git</code> is a project. Results are
+              grouped under it with per-project and per-category totals, and each match is measured once
+              — never double-counted.
+            </p>
+          </div>
+          <div class="card">
+            <div class="ico">⇄</div>
+            <h3>Two modes, one scan</h3>
+            <p>
+              <strong>Redundant Files</strong> lists just the regenerable junk. <strong>Projects</strong>
+              lists every project with its full size and last-edited date, for the ones you are done
+              with entirely.
+            </p>
+          </div>
+          <div class="card">
+            <div class="ico">🛡️</div>
+            <h3>Safe by default</h3>
+            <p>
+              Everything goes to the Recycle Bin. Drive roots, home and system folders are hard-blocked,
+              symlinks are never followed, and you can star a project to protect it from deletion for good.
+            </p>
+          </div>
+          <div class="card">
+            <div class="ico">🤖</div>
+            <h3>Offline AI helper</h3>
+            <p>
+              Forgotten what a folder even was? Download a small Qwen2.5 model and get a plain-English
+              summary of any project — running fully on your machine, with no internet after the download.
+            </p>
+          </div>
+          <div class="card">
+            <div class="ico">📊</div>
+            <h3>Reports &amp; charts</h3>
+            <p>
+              A donut by category, your biggest projects at a glance, a live disk meter, and a full
+              history of every cleanup with what it removed and how much it freed.
+            </p>
+          </div>
+          <div class="card">
+            <div class="ico">🎨</div>
+            <h3>Themes that fit in</h3>
+            <p>
+              Light and dark, six accent colours, and Instrument Sans bundled locally. It looks like a
+              developer tool because it is one.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="how">
+      <div class="wrap">
+        <h2 class="section">Three steps, about a minute</h2>
+        <p class="lede">No configuration required — the defaults are the safe ones.</p>
+        <div class="steps">
+          <div class="step">
+            <h3>Add your projects folder</h3>
+            <p>Point DevBroom at wherever your repos live. It remembers it between launches.</p>
+          </div>
+          <div class="step">
+            <h3>Scan</h3>
+            <p>
+              Watch the count and recoverable total climb live. Results are cached, so reopening the app
+              is instant.
+            </p>
+          </div>
+          <div class="step">
+            <h3>Tick and sweep</h3>
+            <p>
+              Select per item, project or category, confirm, and watch it go — with a progress bar, a
+              Stop button, and a report at the end.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="shots">
+      <div class="wrap">
+        <h2 class="section">A look inside</h2>
+        <p class="lede">Real screens, nothing mocked up.</p>
+        <div class="shots">
+          <figure class="shot">
+            <a href="./assets/screenshot-ai.png" target="_blank" rel="noopener"><img
+              src="./assets/screenshot-ai.png"
+              width="1668"
+              height="943"
+              alt="The What is this? panel open on a project, showing app-generated Detected tech and an AI-written one-paragraph summary."
+              loading="lazy"
+            /></a>
+            <figcaption>
+              <strong>Offline AI helper</strong> — “What is this?” explains a project you no longer
+              recognise, entirely on your machine.
+            </figcaption>
+          </figure>
+          <figure class="shot">
+            <a href="./assets/screenshot-reports.png" target="_blank" rel="noopener"><img
+              src="./assets/screenshot-reports.png"
+              width="1672"
+              height="941"
+              alt="Cleanup history showing a run that freed 1.4 GB across 17 items, with a category breakdown and the full list of what was removed."
+              loading="lazy"
+            /></a>
+            <figcaption>
+              <strong>Reports</strong> — every cleanup logged: what went, where it went, and how much
+              it freed.
+            </figcaption>
+          </figure>
+          <figure class="shot">
+            <a href="./assets/screenshot-settings.png" target="_blank" rel="noopener"><img
+              src="./assets/screenshot-settings.png"
+              width="1672"
+              height="941"
+              alt="Settings showing light and dark mode, six accent colours, deletion safety toggles, and the downloadable local AI models."
+              loading="lazy"
+            /></a>
+            <figcaption>
+              <strong>Settings</strong> — six accents, light or dark, deletion safety, and the local
+              model picker.
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap" style="text-align: center">
+        <h2 class="section">Get your disk space back</h2>
+        <p class="lede" style="margin: 0 auto 34px">
+          Free, MIT licensed, and small enough to read end to end.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/bhrdwjuddhv/DevBroom/releases/latest">
+            ↓ Download DevBroom
+          </a>
+          <a class="btn" href="https://github.com/bhrdwjuddhv/DevBroom#build-from-source">Build from source</a>
+        </div>
+        <p class="subtle">
+          The Windows installer is unsigned, so SmartScreen shows “unknown publisher” — click
+          <strong>More info → Run anyway</strong>. That is normal for free unsigned apps.
+        </p>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">
+        <span>© <span id="year">2026</span> &lt;YOUR NAME&gt; · MIT licensed</span>
+        <span class="spacer"></span>
+        <a href="https://github.com/bhrdwjuddhv/DevBroom">GitHub</a>
+        <a href="https://github.com/bhrdwjuddhv/DevBroom/releases/latest">Releases</a>
+        <a href="https://github.com/bhrdwjuddhv/DevBroom/issues">Report an issue</a>
+      </div>
+    </footer>
+
+    <script>
+      document.getElementById('year').textContent = new Date().getFullYear()
+      // smooth scroll for the in-page nav links
+      for (const a of document.querySelectorAll('a[href^="#"]')) {
+        a.addEventListener('click', (e) => {
+          const el = document.querySelector(a.getAttribute('href'))
+          if (!el) return
+          e.preventDefault()
+          el.scrollIntoView({ behavior: 'smooth' })
+        })
+      }
+    </script>
+  </body>
+</html>

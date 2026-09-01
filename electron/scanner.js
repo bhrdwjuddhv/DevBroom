@@ -239,26 +239,107 @@ async function scan(parentFolders, opts = {}) {
 
 // ---------- delete ----------
 let trashFn
-async function sendToTrash(target) {
+async function sendToTrash(target, log = () => {}) {
   if (!trashFn) {
     try {
       trashFn = (await import('trash')).default
-    } catch {
-      // ponytail: Electron wraps the same OS call; fall back to it if the ESM import ever fails.
-      trashFn = (p) => require('electron').shell.trashItem(p)
+    } catch (err) {
+      log('trash-import-failed', err.message)
+      trashFn = null
     }
   }
-  return trashFn(target)
+  // Two independent implementations of the same idea: the `trash` package shells out to a bundled
+  // windows-trash.exe, Electron's shell.trashItem calls IFileOperation in-process. They fail in
+  // different situations, so a failure from one is worth retrying with the other before giving up.
+  const attempts = []
+  if (trashFn) attempts.push(['trash-package', trashFn])
+  attempts.push(['shell.trashItem', (p) => require('electron').shell.trashItem(p)])
+
+  let lastErr
+  for (const [name, fn] of attempts) {
+    try {
+      await fn(target)
+      return
+    } catch (err) {
+      lastErr = err
+      log('trash-backend-failed', name, err.message)
+    }
+  }
+  throw lastErr
 }
 
 /**
- * Moves paths to Trash (or permanently deletes when permanent === true). Returns bytes actually freed.
- * onProgress({ done, total, current }) fires before each item so the UI can show a determinate bar.
+ * Turns a backend error into something a person can act on.
+ *
+ * Both trash backends report a blocked move uselessly — the `trash` package gives
+ * "Command failed: windows-trash.exe <path>" with empty stderr, and shell.trashItem gives
+ * "Operation was aborted". Neither names a cause, so we say what is actually true and what to do.
  */
-async function remove(paths, { permanent = false, parentFolders = [], protectedPaths = [], onProgress } = {}) {
-  const results = { freed: 0, deleted: [], failed: [] }
+function describeFailure(err) {
+  const raw = String((err && err.message) || err).replace(/\s+/g, ' ').trim()
+  if (
+    /Command failed|Operation was aborted|Failed to perform delete|EBUSY|EPERM|resource busy|being used by another/i.test(
+      raw
+    )
+  )
+    return (
+      'Windows would not move this to the Recycle Bin. Something is almost certainly holding a file ' +
+      'inside it open — a running dev server, a terminal sitting in the folder, or your editor ' +
+      'indexing it. Close those and try again.'
+    )
+  if (/EACCES|access is denied|permission/i.test(raw))
+    return 'Permission denied. Try running DevBroom as the same user that created these files.'
+  if (/ENAMETOOLONG/i.test(raw)) return 'The path is too long for this operation.'
+  return raw || 'unknown error'
+}
+
+/**
+ * Cheap, reliable checks only.
+ *
+ * A tempting idea is to walk the folder and find the locked file by opening each one — that does
+ * NOT work: Node opens with permissive Windows share modes, so the probe succeeds even while the
+ * handle that blocks the move is held. Rather than print a confident wrong answer, we only report
+ * what we can actually prove here and let describeFailure() explain the rest.
+ */
+async function diagnose(target) {
+  try {
+    await fs.lstat(target)
+  } catch (err) {
+    if (err.code === 'ENOENT') return 'already gone'
+    return `cannot read it (${err.code})`
+  }
+  try {
+    await fs.readdir(target)
+  } catch (err) {
+    if (err.code === 'ENOTDIR') return null // a plain file, nothing more to check
+    if (err.code === 'EACCES' || err.code === 'EPERM')
+      return `permission denied reading the folder (${err.code})`
+  }
+  return null
+}
+
+/**
+ * Moves paths to Trash (or permanently deletes when permanent === true).
+ *
+ * Every input path lands in exactly one bucket — deleted / failed / skipped — and "deleted" is only
+ * recorded after the item is verified gone. shouldCancel() is checked between items, so Stop
+ * finishes the item in flight and skips the rest.
+ * onProgress({ done, total, current }); onItem({ path, status, reason, size }).
+ */
+async function remove(paths, opts = {}) {
+  const {
+    permanent = false,
+    parentFolders = [],
+    protectedPaths = [],
+    onProgress,
+    onItem,
+    shouldCancel,
+    log = () => {}
+  } = opts
+  const results = { freed: 0, deleted: [], failed: [], skipped: [], cancelled: false }
   const targets = []
 
+  // ---- validation pass: anything rejected here is a real failure the user must see ----
   for (const p of paths) {
     try {
       const full = assertSafePath(p)
@@ -266,34 +347,74 @@ async function remove(paths, { permanent = false, parentFolders = [], protectedP
         throw new Error('refusing to delete a scanned parent folder')
       if (parentFolders.length && !parentFolders.some((pf) => isInside(full, pf)))
         throw new Error('outside every scanned folder')
-      // enforced here so a UI bug can never delete something the user marked protected
       if (protectedPaths.some((pp) => isInside(full, pp))) throw new Error('project is protected')
       const st = await fs.lstat(full)
       if (st.isSymbolicLink()) throw new Error('symbolic link, skipped')
       const size = st.isDirectory() ? await dirSize(full) : st.size
       targets.push({ full, size })
     } catch (err) {
-      results.failed.push({ path: p, reason: err.message })
+      const reason = err.code === 'ENOENT' ? 'already gone' : err.message
+      log('validate-failed', p, reason)
+      const bucket = reason === 'already gone' ? results.skipped : results.failed
+      bucket.push({ path: p, reason })
+      onItem && onItem({ path: p, status: bucket === results.skipped ? 'skipped' : 'failed', reason })
     }
   }
 
+  // ---- delete pass ----
   for (const [i, t] of targets.entries()) {
+    if (shouldCancel && shouldCancel()) {
+      // Stop was pressed: everything not yet started stays on the dashboard, untouched.
+      results.cancelled = true
+      for (const rest of targets.slice(i)) {
+        results.skipped.push({ path: rest.full, reason: 'stopped before this item' })
+        onItem && onItem({ path: rest.full, status: 'skipped', reason: 'stopped before this item' })
+      }
+      break
+    }
+
     onProgress && onProgress({ done: i, total: targets.length, current: t.full })
     try {
-      if (permanent) await fs.rm(t.full, { recursive: true, force: true })
-      else await sendToTrash(t.full)
+      log('deleting', t.full)
+      if (permanent) await fs.rm(t.full, { recursive: true, force: true, maxRetries: 2, retryDelay: 120 })
+      else await sendToTrash(t.full, log)
+
+      // never report success on the backend's word alone — check it is actually gone
+      let stillThere = true
+      try {
+        await fs.lstat(t.full)
+      } catch {
+        stillThere = false
+      }
+      if (stillThere) throw new Error('the delete call returned without an error but the item is still on disk')
+
       results.freed += t.size
       results.deleted.push({ path: t.full, size: t.size })
+      onItem && onItem({ path: t.full, status: 'deleted', size: t.size })
+      log('deleted', t.full, t.size)
     } catch (err) {
-      results.failed.push({ path: t.full, reason: err.message })
+      const detail = await diagnose(t.full).catch(() => null)
+      if (detail === 'already gone') {
+        // something else removed it; that is a success from the user's point of view
+        results.freed += t.size
+        results.deleted.push({ path: t.full, size: t.size })
+        onItem && onItem({ path: t.full, status: 'deleted', size: t.size })
+      } else {
+        const reason = detail || describeFailure(err)
+        log('FAILED', t.full, reason, err)
+        results.failed.push({ path: t.full, reason })
+        onItem && onItem({ path: t.full, status: 'failed', reason })
+      }
     }
   }
+
   onProgress && onProgress({ done: targets.length, total: targets.length, current: '' })
   return results
 }
 
 module.exports = {
   DEFAULT_RULES,
+  diagnose,
   CATEGORY_NOTES,
   SAFETY_LINES,
   assertSafePath,

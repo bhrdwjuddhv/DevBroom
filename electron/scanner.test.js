@@ -151,3 +151,55 @@ t('every project is returned with a full folder size, and protected projects are
 
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+t('every path lands in exactly one bucket, and Stop leaves the rest untouched', async () => {
+  const root = mkTmp('scan-')
+  const mk = (rel) => {
+    const p = path.join(root, rel)
+    fs.mkdirSync(p, { recursive: true })
+    fs.writeFileSync(path.join(p, 'f.bin'), Buffer.alloc(64))
+    return p
+  }
+  const a = mk('p1/dist')
+  const b = mk('p2/dist')
+  const c = mk('p3/dist')
+  const missing = path.join(root, 'p4', 'dist') // never created
+  const outside = path.join(TMP_ROOT, 'not-in-scope')
+
+  const events = []
+  const res = await remove([a, missing, outside, b, c], {
+    permanent: true,
+    parentFolders: [root],
+    onItem: (i) => events.push(i)
+  })
+
+  // one event per input path, no duplicates, no silent drops
+  assert.strictEqual(events.length, 5)
+  const total = res.deleted.length + res.failed.length + res.skipped.length
+  assert.strictEqual(total, 5, 'every input must be accounted for exactly once')
+  assert.strictEqual(res.deleted.length, 3)
+  assert.deepStrictEqual(res.skipped.map((s) => s.reason), ['already gone'])
+  assert.match(res.failed[0].reason, /outside/)
+  assert.strictEqual(res.freed, 192)
+
+  // "deleted" is only ever reported for something actually gone
+  for (const d of res.deleted) assert.ok(!fs.existsSync(d.path), d.path + ' reported deleted but exists')
+
+  // --- Stop: the item in flight finishes, nothing after it is touched ---
+  const d1 = mk('q1/dist')
+  const d2 = mk('q2/dist')
+  const d3 = mk('q3/dist')
+  let calls = 0
+  const stopped = await remove([d1, d2, d3], {
+    permanent: true,
+    parentFolders: [root],
+    shouldCancel: () => calls++ >= 1 // allow the first, stop before the rest
+  })
+  assert.ok(stopped.cancelled)
+  assert.strictEqual(stopped.deleted.length, 1)
+  assert.strictEqual(stopped.skipped.length, 2)
+  assert.ok(stopped.skipped.every((s) => /stopped/.test(s.reason)))
+  assert.ok(fs.existsSync(d2) && fs.existsSync(d3), 'skipped items must still be on disk')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})

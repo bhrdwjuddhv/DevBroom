@@ -21,7 +21,9 @@ contextBridge.exposeInMainWorld('devbroom', {
 
   deleteItems: (items) => ipcRenderer.invoke('items:delete', items),
   deleteStatus: () => ipcRenderer.invoke('delete:status'),
+  cancelDelete: () => ipcRenderer.invoke('delete:cancel'),
   onDeleteProgress: (cb) => on('delete:progress', cb),
+  onDeleteItem: (cb) => on('delete:item', cb),
 
   diskFree: (target) => ipcRenderer.invoke('disk:free', target),
 

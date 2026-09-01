@@ -10,6 +10,36 @@ const api = window.devbroom
 const RECENT_DAYS = 7
 const WEEK = 7 * DAY
 
+/**
+ * Removes one confirmed-deleted path from the scan result, keeping the totals honest.
+ * Only ever called for items the main process verified are gone from disk.
+ */
+function dropPath(result, target) {
+  let changed = false
+  const projects = []
+  for (const p of result.projects) {
+    if (p.path === target) {
+      changed = true // a whole project folder was deleted
+      continue
+    }
+    const removed = p.items.filter((i) => i.path === target)
+    if (removed.length) {
+      changed = true
+      projects.push({
+        ...p,
+        items: p.items.filter((i) => i.path !== target),
+        totalBytes: Math.max(0, (p.totalBytes ?? 0) - removed.reduce((a, i) => a + i.size, 0))
+      })
+    } else projects.push(p)
+  }
+  if (!changed) return result
+  return {
+    ...result,
+    projects,
+    totalBytes: projects.reduce((s, p) => s + p.items.reduce((a, i) => a + i.size, 0), 0)
+  }
+}
+
 /** Checkbox that can also render the half-checked state, which React can't express declaratively. */
 function TriCheckbox({ checked, indeterminate, ...rest }) {
   const ref = useRef(null)
@@ -35,6 +65,8 @@ export default function App() {
   const [deleting, setDeleting] = useState(null)
   const [disk, setDisk] = useState(null)
   const [diskGain, setDiskGain] = useState(null)
+  const [failures, setFailures] = useState(() => new Map()) // path -> reason, shown as "Failed"
+  const [stopping, setStopping] = useState(false)
   const [toast, setToast] = useState(null)
   const [ai, setAi] = useState(null)
   const [remind, setRemind] = useState(false)
@@ -64,12 +96,33 @@ export default function App() {
 
     const offScan = api.onScanProgress(setProgress)
     const offDel = api.onDeleteProgress((p) => setDeleting(p))
+    // The moment an item is CONFIRMED gone, drop it from the dashboard. Items that failed or were
+    // skipped stay put, so stopping early leaves the list showing exactly what is still on disk.
+    const offItem = api.onDeleteItem(({ path: itemPath, status, reason }) => {
+      if (status === 'deleted') {
+        setResult((r) => (r ? dropPath(r, itemPath) : r))
+        setSelected((prev) => {
+          const next = new Set(prev)
+          next.delete(itemPath)
+          return next
+        })
+        setFailures((f) => {
+          if (!f.has(itemPath)) return f
+          const next = new Map(f)
+          next.delete(itemPath)
+          return next
+        })
+      } else if (status === 'failed') {
+        setFailures((f) => new Map(f).set(itemPath, reason))
+      }
+    })
     const offTok = api.onAiToken(({ key, chunk }) =>
       setAi((a) => (a && a.key === key ? { ...a, text: a.text + chunk } : a))
     )
     return () => {
       offScan()
       offDel()
+      offItem()
       offTok()
     }
   }, [])
@@ -190,23 +243,32 @@ export default function App() {
   }
 
   async function doDelete() {
+    setStopping(false)
     setDeleting({ done: 0, total: selectedItems.length, current: '' })
     const res = await api.deleteItems(selectedItems)
     setDeleting(null)
     setConfirming(false)
+    setStopping(false)
     setAck({ permanent: false, recent: false, projects: false })
     if (res.error) return setToast({ kind: 'error', text: res.error })
-    const failed = res.failed.length ? ` ${res.failed.length} item(s) could not be removed.` : ''
+
+    // Items were already removed from the dashboard one by one as each was confirmed gone, and
+    // failed/skipped ones were deliberately left in place — so there is nothing to rescan here.
+    // A blind rescan is what used to make a successful cleanup look like it had done nothing.
+    const parts = [`Deleted ${res.deleted.length}`]
+    if (res.failed.length) parts.push(`${res.failed.length} failed`)
+    if (res.skipped.length) parts.push(`${res.skipped.length} skipped`)
     setToast({
       kind: res.failed.length ? 'error' : 'ok',
-      text: `Removed ${res.deleted.length} item(s) — freed ${formatBytes(res.freed)} to ${res.report.destination}.${failed}`,
+      text:
+        `${parts.join(' · ')} — freed ${formatBytes(res.freed)} to ${res.report.destination}.` +
+        (res.cancelled ? ' Stopped early; everything else was left alone.' : ''),
       detail: res.failed.map((f) => `${f.path} — ${f.reason}`)
     })
     if (res.report.diskBefore && res.report.diskAfter) {
       setDisk(res.report.diskAfter)
       setDiskGain({ before: res.report.diskBefore, after: res.report.diskAfter })
     }
-    await doScan()
   }
 
   async function toggleProtected(p) {
@@ -588,6 +650,11 @@ export default function App() {
                         </button>
                         <span className="pname">{p.name}</span>
                         {locked && <span className="badge accent">Protected</span>}
+                        {failures.has(p.path) && (
+                          <span className="badge fail" title={failures.get(p.path)}>
+                            Failed
+                          </span>
+                        )}
                         <span className={`badge ${isRecent(p) ? 'warn' : ''}`}>Edited {ago(p.lastModified)}</span>
                         <span className="ppath" title={p.path}>
                           {p.path}
@@ -642,6 +709,11 @@ export default function App() {
                                 <span className="iname">{i.name}</span>
                                 <span className="badge">{i.category}</span>
                                 {!i.safe && <span className="badge warn">review</span>}
+                                {failures.has(i.path) && (
+                                  <span className="badge fail" title={failures.get(i.path)}>
+                                    Failed
+                                  </span>
+                                )}
                                 <span className="ipath" title={i.path} onClick={() => api.reveal(i.path)}>
                                   {i.path}
                                 </span>
@@ -679,8 +751,21 @@ export default function App() {
                   {deleting.current || 'finishing up…'}
                 </div>
                 <p className="muted small" style={{ marginTop: 10 }}>
-                  This runs in the background — minimising or closing this window will not stop it.
+                  This runs in the background — minimising is safe and will not stop it. Closing the
+                  window will ask whether to stop.
                 </p>
+                <div className="modal-actions">
+                  <button
+                    className="danger"
+                    disabled={stopping}
+                    onClick={() => {
+                      setStopping(true)
+                      api.cancelDelete()
+                    }}
+                  >
+                    {stopping ? 'Stopping after this item…' : 'Stop'}
+                  </button>
+                </div>
               </>
             ) : (
               <>
