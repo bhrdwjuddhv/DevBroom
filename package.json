@@ -1,6 +1,6 @@
 {
   "name": "devbroom",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A disk cleanup tool for developers - finds node_modules, build output, caches and logs across your projects and sweeps them to the Recycle Bin.",
   "keywords": [
     "electron",
